@@ -1,5 +1,11 @@
 .stage-card { background-color: transparent; padding: 0; border: none; }
-.stage-preview { border-radius: 8px; background-color: #393b42; box-shadow: 0 3px 9px rgba(0,0,0,0.38); border: 1px solid rgba(255,255,255,0.32); }
-.stage-card:hover .stage-preview, .stage-card:focus .stage-preview { border-color: white; }
-.stage-count { background-color: rgba(27,28,35,0.94); border-radius: 9px; color: white; font-size: 10pt; padding: 0 5px; }
-.stage-caption { color: white; background-color: rgba(23,24,31,0.90); border-radius: 6px; font-size: 9pt; padding: 2px 6px; }
+.stage-face { background-color: transparent; box-shadow: 0 3px 8px rgba(15,12,23,0.32); }
+.stage-card:focus { outline: 1px solid rgba(255,255,255,0.75); border-radius: 8px; }
+.stage-missing { color: white; background-color: rgba(38,39,46,0.92); border-radius: 6px; padding: 6px; font-size: 10pt; }
+.stage-members { background-color: rgba(35,35,40,0.97); color: #fafafa; border-radius: 14px; padding: 8px; border: 1px solid rgba(255,255,255,0.16); box-shadow: 0 8px 24px rgba(0,0,0,0.30); }
+.stage-members-heading { font-size: 10pt; font-weight: bold; color: #d4d4da; padding: 4px 8px 6px; }
+.stage-member { padding: 6px 8px; border-radius: 8px; }
+.stage-member:hover, .stage-member:focus { background-color: rgba(255,255,255,0.12); }
+.stage-member-line { spacing: 10px; }
+.stage-member-app { font-size: 11pt; font-weight: bold; color: white; }
+.stage-member-title { font-size: 10pt; color: #d3d2d8; }

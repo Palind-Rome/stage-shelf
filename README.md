@@ -1,43 +1,60 @@
 # Stage Shelf
 
-为 Ubuntu 24.04 / GNOME Shell 46 实现的台前调度。点击桌面左侧的窗口预览即可切换应用组，同组窗口保留各自的位置和大小。
+Ubuntu 24.04 / GNOME Shell 46 的台前调度扩展。屏幕左侧显示最近窗口的透视缩略图，前台可以是一个窗口，也可以是一组应用。
 
-![在独立的 Ubuntu GNOME 桌面上运行 Stage Shelf](docs/desktop.png)
+![Ubuntu 实际截图：图片查看器在前台，左侧显示三个最近窗口](docs/desktop.png)
 
-## 安装
+## 同时使用两个应用
 
-下载 [Stage Shelf 安装包](https://github.com/Palind-Rome/stage-shelf/raw/refs/heads/main/dist/stage-shelf%40palind-rome.github.io.shell-extension.zip)，在下载目录运行：
+1. 打开两个应用。将左侧的一个预览**拖到当前窗口所在的桌面区域**，或在顶栏菜单选择 **添加窗口到当前组合**。也可以 Shift + 单击预览加入整组。
+2. 两个窗口可以自由移动、调整大小或重叠。要同时看清它们，在顶栏菜单选择 **并排显示两个窗口**。此操作会调整窗口尺寸，退出后保留你选择的排列。
+3. 普通单击其他预览会切换整组。点回组合的叠放预览，两扇窗口会一起恢复。
+
+![实际拖入组合后，图片查看器和文件管理器同时显示](docs/pair.png)
+
+## 查看组合里有哪些窗口
+
+同一组显示错开的窗口预览，下方分别显示应用图标。把鼠标停在组合上，即可按行查看**每扇窗口的应用名和窗口标题**。同一应用的不同文档也分别列出。点击某行会恢复整组，并将所选窗口置于最前。窗口多时可以滚动清单。
+
+![鼠标悬停时显示文件管理器和图片查看器各自的窗口标题](docs/members.png)
+
+## 其他操作
+
+| 操作 | 效果 |
+| --- | --- |
+| 在顶栏菜单选择「将当前窗口移出组合」 | 将焦点窗口单独收进预览列，组内其他窗口留在前台。此项仅在组内有多个可见窗口时出现 |
+| 在顶栏菜单关闭「显示最近窗口」 | 将预览列设为边缘唤出 |
+| 将指针移至工作区左沿中段 | 窗口挡住预览时临时唤出。如果 Ubuntu Dock 固定在左侧，使用紧贴 Dock 的工作区一侧 |
+| 在预览上滚动 | 浏览超出屏幕高度的组 |
+| 选择「退出台前调度」 | 恢复扩展收起的窗口，并关闭扩展及其顶栏图标。可在 GNOME「扩展」中重新开启 |
+
+默认按应用归组。扩展管理主显示器当前工作区的普通窗口。首次展示的单个普通窗口在空间充足时居中，之后可以自行移动。GNOME 最大化继续填满工作区；与预览列重叠时，预览列自动隐藏。全屏与活动概览期间隐藏预览。预览是保存在内存里的窗口快照。切换工作区会还原上一工作区的窗口并重新分组。
+
+## 安装或更新
+
+下载 [扩展安装包](https://github.com/Palind-Rome/stage-shelf/raw/refs/heads/main/dist/stage-shelf%40palind-rome.github.io.shell-extension.zip)，在下载目录运行：
 
 ```sh
-gnome-extensions install stage-shelf@palind-rome.github.io.shell-extension.zip
+gnome-extensions install --force stage-shelf@palind-rome.github.io.shell-extension.zip
 ```
 
-注销并重新登录 Ubuntu，然后运行：
+保存工作、注销并重新登录，然后在 GNOME「扩展」启用 Stage Shelf，或运行：
 
 ```sh
 gnome-extensions enable stage-shelf@palind-rome.github.io
 ```
 
-也可以从源码打包。运行 `gnome-extensions pack extension` 会在当前目录生成相同格式的安装包。
-
-## 使用
-
-| 操作 | 效果 |
-| --- | --- |
-| 单击左侧预览 | 切换到该组，恢复同组窗口 |
-| Shift + 单击预览 | 将这组窗口加入当前组 |
-| 顶栏 Stage Shelf 菜单 → Separate focused application | 将当前应用的窗口拆为独立一组 |
-| 在预览上滚动 | 浏览超出屏幕高度的其他组 |
-| 前台窗口挡住预览时，将指针移至工作区左沿中段 | 临时显示预览。如果 Ubuntu Dock 固定在左侧，请移到 Dock 紧邻桌面的一侧 |
-| 关闭顶栏菜单内的开关 | 还原扩展收起的窗口，回到普通桌面 |
-
-默认按应用分组。预览取自窗口收起时的画面，保存在内存中。全屏和 GNOME 概览期间隐藏侧栏。扩展管理主显示器当前工作区的普通窗口，切换工作区会恢复上一工作区的窗口并重新分组。手动最小化的窗口保持收起。对话框随所属应用处理。
-
-交互与视觉参考 [Apple 台前调度使用指南](https://support.apple.com/guide/mac-help/mchl534ba392/mac)。此项目独立实现，使用 GNOME Shell、Mutter 和系统应用图标。支持的 Shell 主版本为 46。
-
-## 移除
+从源码打包可运行 `gnome-extensions pack extension`。如需移除：
 
 ```sh
 gnome-extensions disable stage-shelf@palind-rome.github.io
 gnome-extensions uninstall stage-shelf@palind-rome.github.io
 ```
+
+## 与 macOS 的对应关系
+
+Apple 的台前调度允许单击切组、拖动组合、同组窗口自由重叠，也支持选择一次显示同一应用的全部窗口或单个窗口。Stage Shelf 默认采用同一应用一起显示的方式，另提供 GNOME 菜单用于编组和并排。[Apple 台前调度指南](https://support.apple.com/zh-cn/guide/mac-help/mchl534ba392/mac)
+
+透视角度、叠放与图标位置参考 Apple 的 Ventura 实机图。Mac 上已有手动放大窗口覆盖预览、边缘唤出预览的演示。GNOME 最大化沿用 Mutter 的工作区尺寸。Ventura 的同一应用窗口堆可以点击应用图标展开；跨应用组合在堆叠下方显示各应用图标。这里另加了悬停标题清单。[MacStories 正式版实测](https://www.macstories.net/stories/macos-ventura-the-macstories-review/2/)
+
+具体 macOS 版本执行原生「填充」时的窗口几何仍需该版本实机验证。[Apple 实机图](https://www.apple.com/newsroom/images/product/os/macos/standard/Apple-WWDC22-macOS-Ventura-Stage-Manager-220606_big.jpg.large.jpg) · [MacStories 操作演示](https://www.macstories.net/stories/macos-ventura-the-macstories-preview/)

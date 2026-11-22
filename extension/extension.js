@@ -1,4 +1,11 @@
 import Clutter from 'gi://Clutter';
+import Cairo from 'cairo';
+import Cogl from 'gi://Cogl';
+import Gdk from 'gi://Gdk?version=4.0';
+import GObject from 'gi://GObject';
+import Graphene from 'gi://Graphene';
+import Mtk from 'gi://Mtk';
+import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
@@ -8,8 +15,27 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
+// Fade the last pixels inside the projected silhouette. Texture filtering
+// alone smooths window contents but leaves the polygon edge aliased.
+const PreviewEdge = GObject.registerClass(class StageShelfPreviewEdge extends Shell.GLSLEffect {
+    vfunc_build_pipeline() {
+        this.add_glsl_snippet(Shell.SnippetHook.FRAGMENT, 'uniform vec2 faceSize;', `
+            vec2 p = abs(cogl_tex_coord_in[0].st - vec2(0.5)) * faceSize;
+            float radius = min(4.0, min(faceSize.x, faceSize.y) * 0.15);
+            vec2 q = p - faceSize * 0.5 + vec2(radius + 1.35);
+            float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+            cogl_color_out *= 1.0 - smoothstep(-1.3, 1.3, d);
+        `, false);
+    }
+
+    sizeFor(width, height) {
+        this.set_uniform_float(this.get_uniform_location('faceSize'), 2, [width, height]);
+    }
+});
+
 export default class StageShelf extends Extension {
     enable() {
+        this._running = true;
         this._signals = [];
         this._watched = new Map();
         this._parked = new Set();
@@ -17,10 +43,14 @@ export default class StageShelf extends Extension {
         this._groups = new Map();
         this._front = null;
         this._pending = 0;
+        this._hintTimer = 0;
         this._offset = 0;
-        this._enabled = true;
+        this._placed = new Map();
+        this._slots = new Map();
+        this._pageKey = '';
+        this._recentVisible = true;
         this._tracker = Shell.WindowTracker.get_default();
-        this._shelf = new St.BoxLayout({vertical: true, reactive: true, track_hover: true, style: 'spacing: 12px;'});
+        this._shelf = new St.BoxLayout({vertical: true, reactive: true, track_hover: true, style: 'spacing: 8px;'});
         Main.layoutManager.addChrome(this._shelf, {trackFullscreen: true});
         this._edge = new St.Widget({reactive: true});
         Main.layoutManager.addChrome(this._edge, {trackFullscreen: true});
@@ -28,10 +58,13 @@ export default class StageShelf extends Extension {
         this._edge.connect('enter-event', () => {
             this._edge.hide();
             this._shelf.show();
+            this._shelf.translation_x = -this._shelf.width * 0.65;
+            this._shelf.opacity = 100;
+            this._shelf.ease({translation_x: 0, opacity: 255, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_CUBIC});
             return Clutter.EVENT_PROPAGATE;
         });
-        this._shelf.connect('leave-event', () => {
-            if (this._covered && !this._shelf.hover)
+        this._shelf.connect('notify::hover', () => {
+            if (this._covered && !this._shelf.hover && !this._hint)
                 this._queue();
             return Clutter.EVENT_PROPAGATE;
         });
@@ -45,15 +78,35 @@ export default class StageShelf extends Extension {
         });
         this._button = new PanelMenu.Button(0, 'Stage Shelf');
         this._button.add_child(new St.Icon({icon_name: 'view-dual-symbolic', style_class: 'system-status-icon'}));
-        const toggle = new PopupMenu.PopupSwitchMenuItem('Stage Shelf', true);
+        const toggle = new PopupMenu.PopupSwitchMenuItem('显示最近窗口', true);
         this._button.menu.addMenuItem(toggle);
         toggle.connect('toggled', (_item, state) => {
-            this._enabled = state;
-            if (!state)
-                this._reset();
+            this._recentVisible = state;
             this._queue();
         });
-        this._button.menu.addAction('Separate focused application', () => this._separate());
+        this._joinMenu = new PopupMenu.PopupSubMenuMenuItem('添加窗口到当前组合');
+        this._button.menu.addMenuItem(this._joinMenu);
+        this._tile = this._button.menu.addAction('并排显示两个窗口', () => this._tilePair());
+        this._split = this._button.menu.addAction('将当前窗口移出组合', () => this._separate());
+        this._button.menu.addAction('退出台前调度', () => Main.extensionManager.disableExtension(this.uuid),
+            'system-log-out-symbolic');
+        this._button.menu.connect('open-state-changed', (_menu, open) => {
+            if (!open)
+                return;
+            const focus = this._focus();
+            const others = this._companions(focus);
+            this._tile.visible = others.length === 1;
+            this._split.visible = others.length > 0;
+            this._joinMenu.menu.removeAll();
+            this._joinMenu.visible = this._watched.has(focus) && this._parked.size > 0;
+            for (const w of this._parked) {
+                const app = this._tracker.get_window_app(w);
+                this._joinMenu.menu.addAction(w.get_title() || app?.get_name() || '窗口', () => {
+                    if (this._parked.has(w))
+                        this._select([w], true);
+                });
+            }
+        });
         Main.panel.addToStatusArea(this.uuid, this._button);
 
         for (const [object, event] of [
@@ -70,7 +123,7 @@ export default class StageShelf extends Extension {
     }
 
     _queue() {
-        if (this._pending)
+        if (!this._running || this._pending)
             return;
         this._pending = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             this._pending = 0;
@@ -85,7 +138,7 @@ export default class StageShelf extends Extension {
 
     _group(w) {
         const id = this._id(w);
-        return this._groups.get(id) ?? id;
+        return this._groups.get(w) ?? id;
     }
 
     _focus() {
@@ -98,10 +151,33 @@ export default class StageShelf extends Extension {
     _restore(w) {
         this._pictures.delete(w);
         if (this._parked.delete(w) && w.minimized)
-            w.unminimize();
+            this._animateWindow(w, false);
+    }
+
+    _animateWindow(w, park) {
+        if (w.get_monitor() < 0) {
+            if (!park)
+                w.unminimize();
+            return;
+        }
+        const area = Main.layoutManager.getWorkAreaForMonitor(w.get_monitor());
+        const width = this._railWidth(area);
+        const slot = this._slots.get(w) ?? new Mtk.Rectangle({x: area.x + 4,
+            y: Math.round(area.y + (area.height - width) / 2), width, height: Math.round(width * 0.85)});
+        const [had, old] = w.get_icon_geometry();
+        w.set_icon_geometry(slot);
+        try {
+            if (park)
+                w.minimize();
+            else
+                w.unminimize();
+        } finally {
+            w.set_icon_geometry(had ? old : null);
+        }
     }
 
     _hideShelf() {
+        this._closeHint();
         this._shelf.hide();
         this._edge.hide();
         this._covered = false;
@@ -110,6 +186,14 @@ export default class StageShelf extends Extension {
     _reset() {
         for (const w of this._parked)
             this._restore(w);
+        for (const [w, pos] of this._placed) {
+            const frame = w.get_frame_rect();
+            if (pos && frame.x === pos.x && frame.y === pos.y && !w.get_maximized() && !w.fullscreen)
+                w.move_frame(false, pos.oldX, pos.oldY);
+        }
+        this._placed.clear();
+        this._slots.clear();
+        this._pageKey = '';
         this._front = null;
         this._groups.clear();
         this._offset = 0;
@@ -121,19 +205,45 @@ export default class StageShelf extends Extension {
         if (!actor?.mapped || !w.can_minimize())
             return;
         try {
-            if (actor.width > 0 && actor.height > 0)
-                this._pictures.set(w, {content: actor.paint_to_content(null), ratio: actor.width / actor.height});
+            const frame = w.get_frame_rect();
+            const buffer = w.get_buffer_rect();
+            const clip = new Mtk.Rectangle({x: frame.x - buffer.x, y: frame.y - buffer.y,
+                width: frame.width, height: frame.height});
+            // The raw window image excludes Shell's in-flight opacity and scale.
+            // Keep only a thumbnail-sized copy after the application is parked.
+            const surface = actor.get_image(clip);
+            let content;
+            if (surface && surface.getWidth() > 0 && surface.getHeight() > 0) {
+                const factor = Math.min(1, 440 / Math.max(surface.getWidth(), surface.getHeight()));
+                const width = Math.max(1, Math.round(surface.getWidth() * factor));
+                const height = Math.max(1, Math.round(surface.getHeight() * factor));
+                const small = new Cairo.ImageSurface(Cairo.Format.ARGB32, width, height);
+                const cr = new Cairo.Context(small);
+                cr.scale(width / surface.getWidth(), height / surface.getHeight());
+                cr.setSourceSurface(surface, 0, 0);
+                cr.paint();
+                cr.$dispose();
+                const pixels = Gdk.pixbuf_get_from_surface(small, 0, 0, width, height);
+                content = new Clutter.Image();
+                content.set_bytes(pixels.read_pixel_bytes(), Cogl.PixelFormat.RGBA_8888,
+                    width, height, pixels.rowstride);
+            } else {
+                content = actor.paint_to_content(clip) ?? actor.paint_to_content(null);
+            }
+            this._pictures.set(w, {content, ratio: frame.width / frame.height});
         } catch (error) {
             console.debug('Stage Shelf preview unavailable', error.message);
         }
         this._parked.add(w);
-        w.minimize();
+        this._animateWindow(w, true);
     }
 
     _sync() {
         const monitor = Main.layoutManager.primaryMonitor;
         const workspace = global.workspace_manager.get_active_workspace();
-        if (!this._enabled || !monitor || Main.overview.visible) {
+        if (this._drop)
+            return;
+        if (!monitor || Main.overview.visible) {
             this._hideShelf();
             return;
         }
@@ -150,16 +260,22 @@ export default class StageShelf extends Extension {
                 this._restore(w);
                 ids.forEach(id => w.disconnect(id));
                 this._watched.delete(w);
+                this._placed.delete(w);
+                this._groups.delete(w);
+                this._slots.delete(w);
             }
         }
         for (const w of windows) {
             if (!this._watched.has(w)) {
-                const ids = ['notify::minimized', 'notify::maximized-horizontally', 'workspace-changed'].map(signal =>
+                const ids = ['notify::minimized', 'notify::maximized-horizontally', 'position-changed', 'size-changed', 'workspace-changed'].map(signal =>
                     w.connect(signal, () => this._queue()));
                 ids.push(w.connect('unmanaged', () => {
                     this._parked.delete(w);
                     this._pictures.delete(w);
                     this._watched.delete(w);
+                    this._placed.delete(w);
+                    this._groups.delete(w);
+                    this._slots.delete(w);
                     this._queue();
                 }));
                 this._watched.set(w, ids);
@@ -186,6 +302,19 @@ export default class StageShelf extends Extension {
                 stages.get(group).push(w);
             }
         }
+        if (stages.size && live.has(focus) && !this._placed.has(focus) && !focus.minimized) {
+            this._placed.set(focus, null);
+            const area = Main.layoutManager.getWorkAreaForMonitor(monitor.index);
+            const r = focus.get_frame_rect();
+            const gutter = this._railWidth(area);
+            if (!focus.get_maximized() && !focus.fullscreen && !focus.get_tile_match() &&
+                !this._companions(focus).length && r.width <= area.width - 2 * gutter && r.height < area.height) {
+                const x = Math.round(area.x + (area.width + gutter - r.width) / 2);
+                const y = Math.round(area.y + (area.height - r.height) / 2);
+                this._placed.set(focus, {x, y, oldX: r.x, oldY: r.y});
+                focus.move_frame(false, x, y);
+            }
+        }
         this._draw([...stages.values()], monitor);
     }
 
@@ -197,7 +326,7 @@ export default class StageShelf extends Extension {
         const target = windows[0];
         if (join && this._front !== null) {
             for (const w of windows)
-                this._groups.set(this._id(w), this._front);
+                this._groups.set(w, this._front);
         }
         this._front = this._group(target);
         for (const w of windows)
@@ -207,94 +336,256 @@ export default class StageShelf extends Extension {
         this._queue();
     }
 
+    _companions(w) {
+        if (!this._watched.has(w))
+            return [];
+        return [...this._watched.keys()].filter(other =>
+            other !== w && !other.minimized && this._group(other) === this._group(w));
+    }
+
+    _tilePair() {
+        const focus = this._focus();
+        const others = this._companions(focus);
+        if (others.length !== 1)
+            return;
+        const area = Main.layoutManager.getWorkAreaForMonitor(focus.get_monitor());
+        const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        const gap = 10 * scale;
+        const inset = this._recentVisible && this._parked.size ? this._railWidth(area) + gap : gap;
+        const width = Math.floor((area.width - inset - 2 * gap) / 2);
+        [others[0], focus].forEach((w, i) => {
+            if (w.fullscreen)
+                w.unmake_fullscreen();
+            w.unmaximize(Meta.MaximizeFlags.BOTH);
+            this._placed.set(w, null);
+            w.move_resize_frame(true, area.x + inset + i * (width + gap), area.y + gap,
+                width, Math.max(1, area.height - 2 * gap));
+        });
+    }
+
     _separate() {
         const w = this._focus();
-        if (!this._watched.has(w))
+        const [next] = this._companions(w);
+        if (!next)
             return;
-        const id = this._id(w);
-        // A fresh group also lets the original owner leave a merged stage.
-        this._groups.set(id, Symbol());
-        this._front = this._group(w);
+        this._groups.set(w, Symbol());
+        this._front = this._group(next);
+        Main.activateWindow(next);
         this._queue();
     }
 
+    _railWidth(area) {
+        const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        return Math.round(Math.min(150 * scale, Math.max(94 * scale, area.width * 0.095)));
+    }
+
     _draw(stages, monitor) {
-        this._shelf.destroy_all_children();
         if (!stages.length || monitor.inFullscreen) {
+            this._pageKey = '';
+            this._shelf.destroy_all_children();
             this._hideShelf();
             return;
         }
         const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
         const area = Main.layoutManager.getWorkAreaForMonitor(monitor.index);
-        const height = 102 * scale;
-        const capacity = Math.max(1, Math.floor(area.height / (height + 12 * scale)));
+        const width = this._railWidth(area);
+        const height = Math.round(width * 0.91);
+        const gap = 8 * scale;
+        const capacity = Math.max(1, Math.floor((area.height - 16 * scale) / (height + gap)));
         this._offset = Math.max(0, Math.min(this._offset, stages.length - capacity));
         const page = stages.slice(this._offset, this._offset + capacity);
-        for (const windows of page)
-            this._shelf.add_child(this._card(windows, scale));
-        const total = page.length * height + (page.length - 1) * 12 * scale;
-        const x = area.x + 4 * scale;
+        const total = page.length * height + (page.length - 1) * gap;
+        const x = area.x + 5 * scale;
         const y = Math.round(area.y + (area.height - total) / 2);
+        const key = JSON.stringify([width, scale, ...page.map(set => set.map(w => w.get_stable_sequence()))]);
+        if (key !== this._pageKey) {
+            this._closeHint();
+            this._shelf.destroy_all_children();
+            for (const windows of page)
+                this._shelf.add_child(this._card(windows, width, height, scale));
+            this._pageKey = key;
+        }
         this._shelf.set_position(x, y);
+        page.forEach((windows, i) => {
+            const slot = new Mtk.Rectangle({x, y: y + i * (height + gap), width, height});
+            for (const w of windows)
+                this._slots.set(w, slot);
+        });
         this._edge.set_position(area.x, y);
         this._edge.set_size(6 * scale, total);
-        this._covered = [...this._watched.keys()].some(w => {
+        this._covered = !this._recentVisible || [...this._watched.keys()].some(w => {
             if (w.minimized)
                 return false;
-            const rect = w.get_frame_rect();
-            return rect.x < x + 132 * scale && rect.x + rect.width > x &&
-                rect.y < y + total && rect.y + rect.height > y;
+            const r = w.get_frame_rect();
+            return r.x < x + width && r.x + r.width > x && r.y < y + total && r.y + r.height > y;
         });
         const [px, py] = global.get_pointer();
-        const inside = px >= area.x && px <= x + 132 * scale && py >= y && py <= y + total;
-        this._shelf.visible = !this._covered || inside;
+        const inside = px >= area.x && px <= x + width && py >= y && py <= y + total;
+        this._shelf.visible = !this._covered || inside || Boolean(this._hint?.hover);
         this._edge.visible = !this._shelf.visible;
     }
 
-    _card(windows, scale) {
-        const w = windows[0];
-        const app = this._tracker.get_window_app(w);
-        const name = app?.get_name() ?? w.get_title();
+    _closeHint() {
+        if (this._hintTimer)
+            GLib.Source.remove(this._hintTimer);
+        this._hintTimer = 0;
+        const hint = this._hint;
+        this._hint = null;
+        hint?.destroy();
+    }
+
+    _delayHint(delay, callback) {
+        if (!this._running)
+            return;
+        if (this._hintTimer)
+            GLib.Source.remove(this._hintTimer);
+        this._hintTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+            this._hintTimer = 0;
+            callback();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _members(button, windows) {
+        this._closeHint();
+        if (this._drop || !button.mapped || !windows.every(w => this._parked.has(w)))
+            return;
+        const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        const area = Main.layoutManager.getWorkAreaForMonitor(Main.layoutManager.primaryIndex);
+        const panel = new St.BoxLayout({vertical: true, reactive: true, track_hover: true,
+            style_class: 'stage-members', width: Math.round(Math.min(312 * scale, area.width * 0.55))});
+        this._hint = panel;
+        const heading = new St.Label({text: `组合中的窗口 · ${windows.length}`, style_class: 'stage-members-heading'});
+        panel.add_child(heading);
+        const scroll = new St.ScrollView({hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC, overlay_scrollbars: true});
+        panel.add_child(scroll);
+        const list = new St.BoxLayout({vertical: true});
+        scroll.set_child(list);
+        for (const w of windows) {
+            const app = this._tracker.get_window_app(w);
+            const title = w.get_title() || '';
+            const name = app?.get_name() || w.get_wm_class() || '窗口';
+            const row = new St.Button({style_class: 'stage-member', can_focus: true,
+                x_expand: true, accessible_name: [name, title].join(' ')});
+            const line = new St.BoxLayout({style_class: 'stage-member-line',
+                width: Math.max(1, panel.width - 36 * scale)});
+            const icon = app?.create_icon_texture(24);
+            if (icon) {
+                icon.y_align = Clutter.ActorAlign.CENTER;
+                line.add_child(icon);
+            }
+            const labels = new St.BoxLayout({vertical: true, x_expand: true});
+            labels.add_child(new St.Label({text: name, style_class: 'stage-member-app'}));
+            if (title && title !== name)
+                labels.add_child(new St.Label({text: title, style_class: 'stage-member-title'}));
+            line.add_child(labels);
+            row.set_child(line);
+            row.connect('clicked', () => {
+                this._closeHint();
+                if (this._parked.has(w))
+                    this._select([w, ...windows.filter(other => other !== w && this._parked.has(other))], false);
+            });
+            list.add_child(row);
+        }
+        Main.layoutManager.addChrome(panel);
+        const maxHeight = Math.round(area.height * 0.63);
+        scroll.height = Math.min(maxHeight, list.get_preferred_height(panel.width - 28 * scale)[1]);
+        const h = panel.get_preferred_height(panel.width)[1];
+        const [x, y] = button.get_transformed_position();
+        panel.set_position(Math.round(x + button.width + 2 * scale),
+            Math.max(area.y, Math.min(area.y + area.height - h, Math.round(y + (button.height - h) / 2))));
+        panel.connect('notify::hover', () => {
+            if (!panel.hover)
+                this._delayHint(220, () => { if (!button.hover) { this._closeHint(); this._queue(); } });
+        });
+        panel.opacity = 0;
+        panel.ease({opacity: 255, duration: 120});
+    }
+
+    _card(windows, width, height, scale) {
+        const apps = windows.map(w => this._tracker.get_window_app(w));
+        const names = [...new Set(windows.map((w, i) => apps[i]?.get_name() ?? w.get_title()))];
         const button = new St.Button({style_class: 'stage-card', can_focus: true,
-            accessible_name: name, track_hover: true});
-        const layout = new Clutter.Actor({width: 132 * scale, height: 102 * scale});
+            accessible_name: names.join(' · '), track_hover: true});
+        const layout = new Clutter.Actor({width, height});
         button.set_child(layout);
-        const shot = this._pictures.get(w);
-        const ratio = shot?.ratio ?? 1.6;
-        const width = Math.min(120, 76 * ratio) * scale;
-        const height = width / ratio;
-        const frame = new St.Widget({style_class: 'stage-preview', width, height});
-        frame.set_position(5 * scale, (78 * scale - height) / 2 + 2 * scale);
-        frame.set_pivot_point(0.5, 0.5);
-        frame.rotation_angle_y = -12;
-        if (shot?.content) {
-            const picture = new Clutter.Actor({content: shot.content, width: Math.max(1, width - 4 * scale),
-                height: Math.max(1, height - 4 * scale)});
-            picture.set_position(2 * scale, 2 * scale);
-            frame.add_child(picture);
+        const count = Math.min(windows.length, 3);
+        let anchorY = 0;
+        for (let i = count - 1; i >= 0; i--) {
+            const shot = this._pictures.get(windows[i]);
+            const ratio = shot?.ratio ?? 1.45;
+            const h = Math.min(height * 0.80, width * 1.34 / ratio);
+            const w = h * ratio;
+            const face = new St.Widget({style_class: 'stage-face', width: w, height: h});
+            if (shot?.content) {
+                const picture = new Clutter.Actor({content: shot.content, width: w, height: h});
+                picture.set_content_scaling_filters(Clutter.ScalingFilter.TRILINEAR, Clutter.ScalingFilter.LINEAR);
+                const edge = new PreviewEdge();
+                picture.add_effect(edge);
+                edge.sizeFor(w, h);
+                face.add_child(picture);
+            } else {
+                const label = new St.Label({text: apps[i]?.get_name() ?? windows[i].get_title(), style_class: 'stage-missing'});
+                face.add_child(label);
+            }
+            const taper = -0.18;
+            const matrix = new Graphene.Matrix();
+            matrix.init_from_float([0.54, taper * h / (2 * w), 0, taper / w,
+                0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+            face.set_transform(matrix);
+            const top = Math.round((height - h) * 0.5);
+            face.set_position(5 * scale + i * 15 * scale, top - i * 5 * scale);
+            layout.add_child(face);
+            if (i === 0)
+                anchorY = top + h;
         }
-        layout.add_child(frame);
-        const icon = app?.create_icon_texture(28) ?? new St.Icon({icon_name: 'application-x-executable', icon_size: 28});
-        icon.set_position(0, 61 * scale);
-        layout.add_child(icon);
-        if (windows.length > 1) {
-            const count = new St.Label({text: String(windows.length), style_class: 'stage-count'});
-            count.set_position(96 * scale, 60 * scale);
-            layout.add_child(count);
-        }
-        const caption = new St.Label({text: name, style_class: 'stage-caption', width: 124 * scale, opacity: 0});
-        caption.set_position(2 * scale, 81 * scale);
-        layout.add_child(caption);
+        const uniqueApps = [...new Set(apps.filter(Boolean))];
+        uniqueApps.slice(0, 3).forEach((app, i) => {
+            const icon = app.create_icon_texture(24);
+            icon.set_position(i * 21 * scale, Math.min(height - 24 * scale, anchorY - 15 * scale));
+            layout.add_child(icon);
+        });
         button.connect('notify::hover', () => {
-            caption.ease({opacity: button.hover ? 255 : 0, duration: 140});
-            frame.ease({rotation_angle_y: button.hover ? 0 : -12, duration: 160});
+            if (windows.length > 1) {
+                if (button.hover)
+                    this._delayHint(320, () => this._members(button, windows));
+                else
+                    this._delayHint(220, () => { if (!this._hint?.hover) { this._closeHint(); this._queue(); } });
+            }
+            layout.ease({translation_x: button.hover ? 5 * scale : 0,
+                scale_x: button.hover ? 1.08 : 1, scale_y: button.hover ? 1.04 : 1, duration: 150});
         });
         button.connect('clicked', () =>
             this._select(windows, Boolean(global.get_pointer()[2] & Clutter.ModifierType.SHIFT_MASK)));
+        button._delegate = {getDragActor: () => new Clutter.Clone({source: layout, width, height}),
+            getDragActorSource: () => layout};
+        const drag = DND.makeDraggable(button);
+        drag.connect('drag-begin', () => {
+            this._closeHint();
+            const area = Main.layoutManager.getWorkAreaForMonitor(Main.layoutManager.primaryIndex);
+            this._drop = new St.Widget({reactive: true});
+            this._drop.set_position(area.x + width + 6 * scale, area.y);
+            this._drop.set_size(Math.max(1, area.width - width - 6 * scale), area.height);
+            this._drop._delegate = {
+                handleDragOver: () => DND.DragMotionResult.MOVE_DROP,
+                acceptDrop: () => {
+                    this._select(windows, true);
+                    return true;
+                },
+            };
+            Main.layoutManager.addChrome(this._drop);
+        });
+        drag.connect('drag-end', () => {
+            this._drop?.destroy();
+            this._drop = null;
+            this._queue();
+        });
         return button;
     }
 
     disable() {
+        this._running = false;
         for (const [object, id] of this._signals)
             object.disconnect(id);
         for (const [w, ids] of this._watched)
@@ -304,6 +595,8 @@ export default class StageShelf extends Extension {
             GLib.Source.remove(this._pending);
         this._pending = 0;
         this._reset();
+        this._drop?.destroy();
+        this._drop = null;
         this._button.destroy();
         Main.layoutManager.removeChrome(this._shelf);
         this._edge.destroy();
