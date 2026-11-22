@@ -14,7 +14,7 @@ Ubuntu 24.04 / GNOME Shell 46 的台前调度扩展。屏幕左侧显示最近�
 
 ## 查看组合里有哪些窗口
 
-同一组显示错开的窗口预览，下方分别显示应用图标。把鼠标停在组合上，即可按行查看**每扇窗口的应用名和窗口标题**。同一应用的不同文档也分别列出。点击某行会恢复整组，并将所选窗口置于最前。窗口多时可以滚动清单。
+同一组按实际窗口位置和相对大小显示预览，下方分别显示应用图标。把鼠标停在组合上，即可按行查看**每扇窗口的应用名和窗口标题**。同一应用的不同文档也分别列出。点击某行会恢复整组，并将所选窗口置于最前。窗口多时可以滚动清单。
 
 ![鼠标悬停时显示文件管理器和图片查看器各自的窗口标题](docs/members.png)
 
@@ -28,7 +28,7 @@ Ubuntu 24.04 / GNOME Shell 46 的台前调度扩展。屏幕左侧显示最近�
 | 在预览上滚动 | 浏览超出屏幕高度的组 |
 | 选择「退出台前调度」 | 恢复扩展收起的窗口，并关闭扩展及其顶栏图标。可在 GNOME「扩展」中重新开启 |
 
-默认按应用归组。扩展管理主显示器当前工作区的普通窗口。首次展示的单个普通窗口在空间充足时居中，之后可以自行移动。GNOME 最大化继续填满工作区；与预览列重叠时，预览列自动隐藏。全屏与活动概览期间隐藏预览。预览是保存在内存里的窗口快照。切换工作区会还原上一工作区的窗口并重新分组。
+默认按应用归组。扩展管理主显示器当前工作区的普通窗口。首次展示的单个普通窗口在空间充足时居中，之后可以自行移动。GNOME 最大化继续填满工作区；与预览列重叠时，预览列自动隐藏。全屏与活动概览期间隐藏预览。全屏期间依据应用窗口的全屏状态保持隐藏，即使 Fcitx5 候选窗临时出现在应用之上。预览是保存在内存里的窗口快照。切换工作区会还原上一工作区的窗口并重新分组。
 
 ## 安装或更新
 
@@ -56,5 +56,7 @@ gnome-extensions uninstall stage-shelf@palind-rome.github.io
 Apple 的台前调度允许单击切组、拖动组合、同组窗口自由重叠，也支持选择一次显示同一应用的全部窗口或单个窗口。Stage Shelf 默认采用同一应用一起显示的方式，另提供 GNOME 菜单用于编组和并排。[Apple 台前调度指南](https://support.apple.com/zh-cn/guide/mac-help/mchl534ba392/mac)
 
 透视角度、叠放与图标位置参考 Apple 的 Ventura 实机图。Mac 上已有手动放大窗口覆盖预览、边缘唤出预览的演示。GNOME 最大化沿用 Mutter 的工作区尺寸。Ventura 的同一应用窗口堆可以点击应用图标展开；跨应用组合在堆叠下方显示各应用图标。这里另加了悬停标题清单。[MacStories 正式版实测](https://www.macstories.net/stories/macos-ventura-the-macstories-review/2/)
+
+支持原生全屏的 Mac 应用，普通单击绿色按钮会进入全屏幕视图。桌面上的「填充」是另一条命令，可以通过绿色按钮悬停菜单或 Fn-Control-F 触发。[Apple 全屏幕指南](https://support.apple.com/zh-cn/guide/mac-help/mchl9c21d2be/mac) · [Apple 窗口排列指南](https://support.apple.com/zh-cn/guide/mac-help/mchlp2469/mac)
 
 具体 macOS 版本执行原生「填充」时的窗口几何仍需该版本实机验证。[Apple 实机图](https://www.apple.com/newsroom/images/product/os/macos/standard/Apple-WWDC22-macOS-Ventura-Stage-Manager-220606_big.jpg.large.jpg) · [MacStories 操作演示](https://www.macstories.net/stories/macos-ventura-the-macstories-preview/)

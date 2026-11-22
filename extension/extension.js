@@ -1,7 +1,4 @@
 import Clutter from 'gi://Clutter';
-import Cairo from 'cairo';
-import Cogl from 'gi://Cogl';
-import Gdk from 'gi://Gdk?version=4.0';
 import GObject from 'gi://GObject';
 import Graphene from 'gi://Graphene';
 import Mtk from 'gi://Mtk';
@@ -56,6 +53,10 @@ export default class StageShelf extends Extension {
         Main.layoutManager.addChrome(this._edge, {trackFullscreen: true});
         this._edge.hide();
         this._edge.connect('enter-event', () => {
+            if (this._fullscreen()) {
+                this._hideShelf();
+                return Clutter.EVENT_PROPAGATE;
+            }
             this._edge.hide();
             this._shelf.show();
             this._shelf.translation_x = -this._shelf.width * 0.65;
@@ -114,7 +115,7 @@ export default class StageShelf extends Extension {
             [global.display, 'grab-op-end'], [global.display, 'workareas-changed'], [global.display, 'in-fullscreen-changed'],
             [global.display, 'window-entered-monitor'], [global.display, 'window-left-monitor'],
             [global.workspace_manager, 'active-workspace-changed'],
-            [global.window_manager, 'map'], [Main.overview, 'hidden'],
+            [global.window_manager, 'map'], [global.window_manager, 'destroy'], [Main.overview, 'hidden'],
             [Main.layoutManager, 'monitors-changed'],
         ])
             this._signals.push([object, object.connect(event, () => this._queue())]);
@@ -209,27 +210,9 @@ export default class StageShelf extends Extension {
             const buffer = w.get_buffer_rect();
             const clip = new Mtk.Rectangle({x: frame.x - buffer.x, y: frame.y - buffer.y,
                 width: frame.width, height: frame.height});
-            // The raw window image excludes Shell's in-flight opacity and scale.
-            // Keep only a thumbnail-sized copy after the application is parked.
-            const surface = actor.get_image(clip);
-            let content;
-            if (surface && surface.getWidth() > 0 && surface.getHeight() > 0) {
-                const factor = Math.min(1, 440 / Math.max(surface.getWidth(), surface.getHeight()));
-                const width = Math.max(1, Math.round(surface.getWidth() * factor));
-                const height = Math.max(1, Math.round(surface.getHeight() * factor));
-                const small = new Cairo.ImageSurface(Cairo.Format.ARGB32, width, height);
-                const cr = new Cairo.Context(small);
-                cr.scale(width / surface.getWidth(), height / surface.getHeight());
-                cr.setSourceSurface(surface, 0, 0);
-                cr.paint();
-                cr.$dispose();
-                const pixels = Gdk.pixbuf_get_from_surface(small, 0, 0, width, height);
-                content = new Clutter.Image();
-                content.set_bytes(pixels.read_pixel_bytes(), Cogl.PixelFormat.RGBA_8888,
-                    width, height, pixels.rowstride);
-            } else {
-                content = actor.paint_to_content(clip) ?? actor.paint_to_content(null);
-            }
+            // A freshly mapped actor may not have received a buffer yet.
+            const content = actor.get_texture()?.get_texture()
+                ? actor.paint_to_content(clip) ?? actor.paint_to_content(null) : null;
             this._pictures.set(w, {content, ratio: frame.width / frame.height});
         } catch (error) {
             console.debug('Stage Shelf preview unavailable', error.message);
@@ -238,12 +221,23 @@ export default class StageShelf extends Extension {
         this._animateWindow(w, true);
     }
 
+    _fullscreen() {
+        const monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor)
+            return false;
+        const ws = global.workspace_manager.get_active_workspace();
+        // IME candidate windows may temporarily defeat Mutter's monitor-level
+        // fullscreen heuristic. The underlying client's fullscreen flag persists.
+        return monitor.inFullscreen || ws.list_windows().some(w =>
+            w.fullscreen && !w.minimized && w.get_monitor() === monitor.index);
+    }
+
     _sync() {
         const monitor = Main.layoutManager.primaryMonitor;
         const workspace = global.workspace_manager.get_active_workspace();
         if (this._drop)
             return;
-        if (!monitor || Main.overview.visible) {
+        if (!monitor || Main.overview.visible || this._fullscreen()) {
             this._hideShelf();
             return;
         }
@@ -267,7 +261,7 @@ export default class StageShelf extends Extension {
         }
         for (const w of windows) {
             if (!this._watched.has(w)) {
-                const ids = ['notify::minimized', 'notify::maximized-horizontally', 'position-changed', 'size-changed', 'workspace-changed'].map(signal =>
+                const ids = ['notify::minimized', 'notify::fullscreen', 'notify::maximized-horizontally', 'position-changed', 'size-changed', 'workspace-changed'].map(signal =>
                     w.connect(signal, () => this._queue()));
                 ids.push(w.connect('unmanaged', () => {
                     this._parked.delete(w);
@@ -380,7 +374,7 @@ export default class StageShelf extends Extension {
     }
 
     _draw(stages, monitor) {
-        if (!stages.length || monitor.inFullscreen) {
+        if (!stages.length || this._fullscreen()) {
             this._pageKey = '';
             this._shelf.destroy_all_children();
             this._hideShelf();
@@ -401,8 +395,10 @@ export default class StageShelf extends Extension {
         if (key !== this._pageKey) {
             this._closeHint();
             this._shelf.destroy_all_children();
-            for (const windows of page)
-                this._shelf.add_child(this._card(windows, width, height, scale));
+            page.forEach((windows, i) => {
+                const tilt = Math.max(-1, Math.min(1, (total / 2 - i * (height + gap) - height / 2) / (2 * height)));
+                this._shelf.add_child(this._card(windows, width, height, scale, tilt));
+            });
             this._pageKey = key;
         }
         this._shelf.set_position(x, y);
@@ -455,6 +451,7 @@ export default class StageShelf extends Extension {
         const panel = new St.BoxLayout({vertical: true, reactive: true, track_hover: true,
             style_class: 'stage-members', width: Math.round(Math.min(312 * scale, area.width * 0.55))});
         this._hint = panel;
+        Main.layoutManager.addChrome(panel);
         const heading = new St.Label({text: `组合中的窗口 · ${windows.length}`, style_class: 'stage-members-heading'});
         panel.add_child(heading);
         const scroll = new St.ScrollView({hscrollbar_policy: St.PolicyType.NEVER,
@@ -488,7 +485,6 @@ export default class StageShelf extends Extension {
             });
             list.add_child(row);
         }
-        Main.layoutManager.addChrome(panel);
         const maxHeight = Math.round(area.height * 0.63);
         scroll.height = Math.min(maxHeight, list.get_preferred_height(panel.width - 28 * scale)[1]);
         const h = panel.get_preferred_height(panel.width)[1];
@@ -503,20 +499,34 @@ export default class StageShelf extends Extension {
         panel.ease({opacity: 255, duration: 120});
     }
 
-    _card(windows, width, height, scale) {
+    _card(windows, width, height, scale, tilt) {
         const apps = windows.map(w => this._tracker.get_window_app(w));
         const names = [...new Set(windows.map((w, i) => apps[i]?.get_name() ?? w.get_title()))];
         const button = new St.Button({style_class: 'stage-card', can_focus: true,
             accessible_name: names.join(' · '), track_hover: true});
         const layout = new Clutter.Actor({width, height});
         button.set_child(layout);
-        const count = Math.min(windows.length, 3);
-        let anchorY = 0;
-        for (let i = count - 1; i >= 0; i--) {
+        const rects = windows.slice(0, 4).map(w => w.get_frame_rect());
+        const left = Math.min(...rects.map(r => r.x));
+        const top = Math.min(...rects.map(r => r.y));
+        const spanX = Math.max(...rects.map(r => r.x + r.width)) - left;
+        const spanY = Math.max(...rects.map(r => r.y + r.height)) - top;
+        const shrink = Math.min(height * 0.78 / Math.max(1, spanY), width * 1.40 / Math.max(1, spanX));
+        const composite = new Clutter.Actor({width: spanX * shrink, height: spanY * shrink});
+        const taper = 0.12;
+        const matrix = new Graphene.Matrix();
+        matrix.init_from_float([0.72, tilt * 0.15 + taper * composite.height / (2 * composite.width),
+            0, taper / composite.width, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+        composite.set_transform(matrix);
+        const y = Math.round((height - composite.height) / 2);
+        composite.set_position(5 * scale, y);
+        layout.add_child(composite);
+        const anchorY = y + composite.height;
+        for (let i = rects.length - 1; i >= 0; i--) {
+            const r = rects[i];
             const shot = this._pictures.get(windows[i]);
-            const ratio = shot?.ratio ?? 1.45;
-            const h = Math.min(height * 0.80, width * 1.34 / ratio);
-            const w = h * ratio;
+            const w = Math.max(1, r.width * shrink);
+            const h = Math.max(1, r.height * shrink);
             const face = new St.Widget({style_class: 'stage-face', width: w, height: h});
             if (shot?.content) {
                 const picture = new Clutter.Actor({content: shot.content, width: w, height: h});
@@ -529,16 +539,12 @@ export default class StageShelf extends Extension {
                 const label = new St.Label({text: apps[i]?.get_name() ?? windows[i].get_title(), style_class: 'stage-missing'});
                 face.add_child(label);
             }
-            const taper = -0.18;
-            const matrix = new Graphene.Matrix();
-            matrix.init_from_float([0.54, taper * h / (2 * w), 0, taper / w,
-                0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
-            face.set_transform(matrix);
-            const top = Math.round((height - h) * 0.5);
-            face.set_position(5 * scale + i * 15 * scale, top - i * 5 * scale);
-            layout.add_child(face);
-            if (i === 0)
-                anchorY = top + h;
+            // Expose a sliver when multiple windows occupy the same rectangle.
+            const coincident = i > 0 && Math.abs(r.x - rects[0].x) * shrink < 4 * scale &&
+                Math.abs(r.y - rects[0].y) * shrink < 4 * scale;
+            face.set_position((r.x - left) * shrink + (coincident ? 7 * scale * i : 0),
+                (r.y - top) * shrink - (coincident ? 3 * scale * i : 0));
+            composite.add_child(face);
         }
         const uniqueApps = [...new Set(apps.filter(Boolean))];
         uniqueApps.slice(0, 3).forEach((app, i) => {
