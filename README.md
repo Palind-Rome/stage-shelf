@@ -6,7 +6,7 @@
 
 ## 安装
 
-下载 [GitHub Release](https://github.com/Palind-Rome/stage-shelf/releases/latest) 中的扩展包，在下载目录运行：
+下载 [Stage Shelf 安装包](https://github.com/Palind-Rome/stage-shelf/raw/refs/heads/main/dist/stage-shelf%40palind-rome.github.io.shell-extension.zip)，在下载目录运行：
 
 ```sh
 gnome-extensions install stage-shelf@palind-rome.github.io.shell-extension.zip
