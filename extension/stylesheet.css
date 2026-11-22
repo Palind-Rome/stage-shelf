@@ -1,0 +1,5 @@
+.stage-card { background-color: transparent; padding: 0; border: none; }
+.stage-preview { border-radius: 8px; background-color: #393b42; box-shadow: 0 3px 9px rgba(0,0,0,0.38); border: 1px solid rgba(255,255,255,0.32); }
+.stage-card:hover .stage-preview, .stage-card:focus .stage-preview { border-color: white; }
+.stage-count { background-color: rgba(27,28,35,0.94); border-radius: 9px; color: white; font-size: 10pt; padding: 0 5px; }
+.stage-caption { color: white; background-color: rgba(23,24,31,0.90); border-radius: 6px; font-size: 9pt; padding: 2px 6px; }
