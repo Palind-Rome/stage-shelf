@@ -11,3 +11,4 @@
 .stage-member-title { font-size: 10pt; color: #d3d2d8; }
 .stage-remove-target { padding: 20px 4px; text-align: center; color: white; background-color: rgba(36,39,47,0.92); border-radius: 10px; }
 .stage-unavailable { background-color: #32333b; border-radius: 6px; }
+.stage-idle-shade { background-color: black; border-radius: 4px; }

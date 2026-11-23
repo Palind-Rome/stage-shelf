@@ -232,7 +232,10 @@ export default class StageShelf extends Extension {
         }
     }
 
-    _turnShelf(open = this._shelf.hover || Boolean(this._hint?.hover)) {
+    _turnShelf(open = this._covered && (this._shelf.hover || Boolean(this._hint?.hover))) {
+        if (this._openingTarget === Boolean(open))
+            return;
+        this._openingTarget = Boolean(open);
         this._opening.ease(open ? 1 : 0, {
             duration: open ? 210 : 185,
             mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
@@ -244,6 +247,7 @@ export default class StageShelf extends Extension {
         this._shelf.hide();
         this._edge.hide();
         this._covered = false;
+        this._turnShelf(false);
     }
 
     _reset() {
@@ -556,7 +560,7 @@ export default class StageShelf extends Extension {
         const width = this._railWidth(area);
         const height = Math.round(width * 0.91);
         const gap = 8 * scale;
-        const capacity = Math.max(1, Math.floor((area.height - 16 * scale) / (height + gap)));
+        const capacity = Math.max(1, Math.min(6, Math.floor((area.height - 16 * scale) / (height + gap))));
         this._offset = Math.max(0, Math.min(this._offset, stages.length - capacity));
         const page = stages.slice(this._offset, this._offset + capacity);
         const total = page.length * height + (page.length - 1) * gap;
@@ -590,6 +594,7 @@ export default class StageShelf extends Extension {
         const inside = px >= area.x && px <= x + width && py >= y && py <= y + total;
         this._shelf.visible = !this._covered || inside || Boolean(this._hint?.hover);
         this._edge.visible = !this._shelf.visible;
+        this._turnShelf(this._covered && this._shelf.visible);
     }
 
     _closeHint() {
@@ -684,6 +689,7 @@ export default class StageShelf extends Extension {
         const spanX = Math.max(...rects.map(r => r.x + r.width)) - left;
         const spanY = Math.max(...rects.map(r => r.y + r.height)) - top;
         const shrink = Math.min(height * 0.78 / Math.max(1, spanY), width * 1.40 / Math.max(1, spanX));
+        const shades = [];
         const composite = new Clutter.Actor({width: spanX * shrink, height: spanY * shrink});
         const updatePerspective = () => {
             const progress = this._opening.value;
@@ -728,6 +734,9 @@ export default class StageShelf extends Extension {
                 face.add_child(label);
                 label.y = Math.round(h * 0.35);
             }
+            const shade = new St.Widget({style_class: 'stage-idle-shade', width: w, height: h, opacity: 32});
+            face.add_child(shade);
+            shades.push(shade);
             // Expose a sliver when multiple windows occupy the same rectangle.
             const coincident = i > 0 && Math.abs(r.x - rects[0].x) * shrink < 4 * scale &&
                 Math.abs(r.y - rects[0].y) * shrink < 4 * scale;
@@ -746,7 +755,13 @@ export default class StageShelf extends Extension {
             composite.connectObject('notify::y', positionIcon, icon);
             layout.add_child(icon);
         });
+        composite.set_pivot_point(0, 0.5);
         button.connect('notify::hover', () => {
+            const magnification = button.hover && !this._covered ? 1.08 : 1;
+            composite.ease({scale_x: magnification, scale_y: magnification, duration: 145,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC});
+            for (const shade of shades)
+                shade.ease({opacity: button.hover ? 0 : 32, duration: 145});
             if (windows.length > 1) {
                 if (button.hover)
                     this._delayHint(320, () => this._members(button, windows));
@@ -768,7 +783,7 @@ export default class StageShelf extends Extension {
             this._drop._delegate = {
                 handleDragOver: () => DND.DragMotionResult.MOVE_DROP,
                 acceptDrop: () => {
-                    this._select(windows, true);
+                    this._select([windows[0]], true);
                     return true;
                 },
             };
