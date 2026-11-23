@@ -36,6 +36,10 @@ export default class StageShelf extends Extension {
         this._signals = [];
         this._watched = new Map();
         this._parked = new Set();
+        this._manual = new Set();
+        this._single = false;
+        this._updates = new Set();
+        this._updateTimer = 0;
         this._pictures = new Map();
         this._groups = new Map();
         this._front = null;
@@ -85,6 +89,13 @@ export default class StageShelf extends Extension {
             this._recentVisible = state;
             this._queue();
         });
+        const single = new PopupMenu.PopupSwitchMenuItem('同一应用一次显示一个窗口', false);
+        this._button.menu.addMenuItem(single);
+        single.connect('toggled', (_item, state) => {
+            this._single = state;
+            this._queue();
+        });
+        this._button.menu.addAction('显示桌面', () => this._desktop());
         this._joinMenu = new PopupMenu.PopupSubMenuMenuItem('添加窗口到当前组合');
         this._button.menu.addMenuItem(this._joinMenu);
         this._tile = this._button.menu.addAction('并排显示两个窗口', () => this._tilePair());
@@ -119,6 +130,42 @@ export default class StageShelf extends Extension {
             [Main.layoutManager, 'monitors-changed'],
         ])
             this._signals.push([object, object.connect(event, () => this._queue())]);
+        this._signals.push([global.stage, global.stage.connect('captured-event', (_actor, event) => {
+            if (event.type() === Clutter.EventType.BUTTON_PRESS && event.get_button() === 1) {
+                const [x, y] = event.get_coords();
+                const hit = global.stage.get_actor_at_pos(Clutter.PickMode.ALL, x, y);
+                if (hit && Main.layoutManager._backgroundGroup?.contains(hit))
+                    this._desktop();
+            }
+            return Clutter.EVENT_PROPAGATE;
+        })]);
+        this._signals.push([global.display, global.display.connect('notify::focus-window', () => {
+            if (global.display.focus_window?.get_window_type() === Meta.WindowType.DESKTOP)
+                this._desktop();
+        })]);
+        this._signals.push([global.display, global.display.connect('grab-op-begin', (_display, w, op) => {
+            if (![Meta.GrabOp.MOVING, Meta.GrabOp.MOVING_UNCONSTRAINED].includes(op) ||
+                !this._companions(w).length || this._fullscreen())
+                return;
+            const area = Main.layoutManager.getWorkAreaForMonitor(w.get_monitor());
+            const width = this._railWidth(area);
+            this._removeTarget = new St.Label({text: '移出组合', style_class: 'stage-remove-target',
+                width, y_align: Clutter.ActorAlign.CENTER});
+            Main.layoutManager.addChrome(this._removeTarget);
+            this._removeTarget.set_position(area.x, area.y + Math.floor(area.height / 2));
+        })]);
+        this._signals.push([global.display, global.display.connect('grab-op-end', (_display, w) => {
+            const target = this._removeTarget;
+            if (!target)
+                return;
+            const [x, y] = global.get_pointer();
+            const [tx, ty] = target.get_transformed_position();
+            const inside = x >= tx && x < tx + target.width && y >= ty && y < ty + target.height;
+            target.destroy();
+            this._removeTarget = null;
+            if (inside)
+                this._separate(w);
+        })]);
         this._signals.push([Main.overview, Main.overview.connect('showing', () => this._hideShelf())]);
         this._queue();
     }
@@ -139,7 +186,7 @@ export default class StageShelf extends Extension {
 
     _group(w) {
         const id = this._id(w);
-        return this._groups.get(w) ?? id;
+        return this._groups.get(w) ?? (this._single ? w : id);
     }
 
     _focus() {
@@ -150,6 +197,7 @@ export default class StageShelf extends Extension {
     }
 
     _restore(w) {
+        this._manual.delete(w);
         this._pictures.delete(w);
         if (this._parked.delete(w) && w.minimized)
             this._animateWindow(w, false);
@@ -185,6 +233,11 @@ export default class StageShelf extends Extension {
     }
 
     _reset() {
+        for (const w of this._manual) {
+            this._parked.delete(w);
+            this._pictures.delete(w);
+        }
+        this._manual.clear();
         for (const w of this._parked)
             this._restore(w);
         for (const [w, pos] of this._placed) {
@@ -205,16 +258,54 @@ export default class StageShelf extends Extension {
         const actor = w.get_compositor_private();
         if (!actor?.mapped || !w.can_minimize())
             return;
+        this._capture(w, actor);
+        this._parked.add(w);
+        this._animateWindow(w, true);
+    }
+
+    _capture(w, actor) {
         try {
             // Capture the entire actor, including client-side decorations.
             // A freshly mapped actor may not have received a buffer yet.
             const content = actor.get_texture()?.get_texture() ? actor.paint_to_content(null) : null;
-            this._pictures.set(w, {content});
+            if (content) {
+                this._pictures.set(w, {content});
+                if (this._parked.has(w))
+                    this._pageKey = '';
+            }
         } catch (error) {
             console.debug('Stage Shelf preview unavailable', error.message);
         }
-        this._parked.add(w);
-        this._animateWindow(w, true);
+    }
+
+    _desktop() {
+        if (Main.overview.visible || this._fullscreen())
+            return;
+        for (const w of this._watched.keys()) {
+            if (!w.minimized)
+                this._park(w);
+        }
+        this._front = null;
+        this._queue();
+    }
+
+    _damage(w) {
+        if (!this._parked.has(w) || !this._shelf.visible)
+            return;
+        this._updates.add(w);
+        if (this._updateTimer)
+            return;
+        this._updateTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+            this._updateTimer = 0;
+            for (const window of this._updates) {
+                const actor = window.get_compositor_private();
+                if (this._parked.has(window) && actor?.mapped)
+                    this._capture(window, actor);
+            }
+            this._updates.clear();
+            this._queue();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _fullscreen() {
@@ -247,7 +338,10 @@ export default class StageShelf extends Extension {
         const live = new Set(windows);
         for (const [w, ids] of this._watched) {
             if (!live.has(w)) {
+                if (this._manual.delete(w))
+                    this._parked.delete(w);
                 this._restore(w);
+                w.get_compositor_private()?.disconnectObject(this);
                 ids.forEach(id => w.disconnect(id));
                 this._watched.delete(w);
                 this._placed.delete(w);
@@ -257,9 +351,26 @@ export default class StageShelf extends Extension {
         }
         for (const w of windows) {
             if (!this._watched.has(w)) {
-                const ids = ['notify::minimized', 'notify::fullscreen', 'notify::maximized-horizontally', 'position-changed', 'size-changed', 'workspace-changed'].map(signal =>
+                const ids = ['notify::fullscreen', 'notify::maximized-horizontally', 'position-changed', 'size-changed', 'workspace-changed'].map(signal =>
                     w.connect(signal, () => this._queue()));
+                const actor = w.get_compositor_private();
+                actor?.connectObject('damaged', () => this._damage(w), this);
+                ids.push(w.connect('notify::minimized', () => {
+                    if (w.minimized && !this._parked.has(w)) {
+                        if (actor?.mapped)
+                            this._capture(w, actor);
+                        this._groups.set(w, Symbol());
+                        this._parked.add(w);
+                        this._manual.add(w);
+                    } else if (!w.minimized) {
+                        this._manual.delete(w);
+                    }
+                    this._queue();
+                }));
                 ids.push(w.connect('unmanaged', () => {
+                    actor?.disconnectObject(this);
+                    this._updates.delete(w);
+                    this._manual.delete(w);
                     this._parked.delete(w);
                     this._pictures.delete(w);
                     this._watched.delete(w);
@@ -315,6 +426,11 @@ export default class StageShelf extends Extension {
     _select(windows, join) {
         const target = windows[0];
         if (join && this._front !== null) {
+            // Preserve explicitly joined members across display-mode changes.
+            for (const w of this._watched.keys()) {
+                if (!w.minimized && this._group(w) === this._front)
+                    this._groups.set(w, this._front);
+            }
             for (const w of windows)
                 this._groups.set(w, this._front);
         }
@@ -353,13 +469,13 @@ export default class StageShelf extends Extension {
         });
     }
 
-    _separate() {
-        const w = this._focus();
+    _separate(w = this._focus()) {
         const [next] = this._companions(w);
         if (!next)
             return;
         this._groups.set(w, Symbol());
         this._front = this._group(next);
+        this._park(w);
         Main.activateWindow(next);
         this._queue();
     }
@@ -502,7 +618,7 @@ export default class StageShelf extends Extension {
             accessible_name: names.join(' · '), track_hover: true});
         const layout = new Clutter.Actor({width, height});
         button.set_child(layout);
-        const rects = windows.slice(0, 4).map(w => w.get_frame_rect());
+        const rects = windows.map(w => w.get_frame_rect());
         const left = Math.min(...rects.map(r => r.x));
         const top = Math.min(...rects.map(r => r.y));
         const spanX = Math.max(...rects.map(r => r.x + r.width)) - left;
@@ -538,8 +654,8 @@ export default class StageShelf extends Extension {
             // Expose a sliver when multiple windows occupy the same rectangle.
             const coincident = i > 0 && Math.abs(r.x - rects[0].x) * shrink < 4 * scale &&
                 Math.abs(r.y - rects[0].y) * shrink < 4 * scale;
-            face.set_position((r.x - left) * shrink + (coincident ? 7 * scale * i : 0),
-                (r.y - top) * shrink - (coincident ? 3 * scale * i : 0));
+            face.set_position((r.x - left) * shrink + (coincident ? 7 * scale * Math.min(3, i) : 0),
+                (r.y - top) * shrink - (coincident ? 3 * scale * Math.min(3, i) : 0));
             composite.add_child(face);
         }
         const uniqueApps = [...new Set(apps.filter(Boolean))];
@@ -588,10 +704,17 @@ export default class StageShelf extends Extension {
 
     disable() {
         this._running = false;
+        this._removeTarget?.destroy();
+        this._removeTarget = null;
         for (const [object, id] of this._signals)
             object.disconnect(id);
-        for (const [w, ids] of this._watched)
+        for (const [w, ids] of this._watched) {
+            w.get_compositor_private()?.disconnectObject(this);
             ids.forEach(id => w.disconnect(id));
+        }
+        if (this._updateTimer)
+            GLib.Source.remove(this._updateTimer);
+        this._updates.clear();
         this._watched.clear();
         if (this._pending)
             GLib.Source.remove(this._pending);

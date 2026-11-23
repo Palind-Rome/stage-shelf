@@ -9,3 +9,4 @@
 .stage-member-line { spacing: 10px; }
 .stage-member-app { font-size: 11pt; font-weight: bold; color: white; }
 .stage-member-title { font-size: 10pt; color: #d3d2d8; }
+.stage-remove-target { padding: 20px 4px; text-align: center; color: white; background-color: rgba(36,39,47,0.92); border-radius: 10px; }
