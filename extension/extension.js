@@ -142,6 +142,8 @@ export default class StageShelf extends Extension {
             if (event.type() === Clutter.EventType.BUTTON_PRESS && event.get_button() === 1) {
                 const [x, y] = event.get_coords();
                 const hit = global.stage.get_actor_at_pos(Clutter.PickMode.ALL, x, y);
+                if (this._picker && hit && !this._hint?.contains(hit) && !this._picker.contains(hit))
+                    this._closeHint();
                 if (hit && Main.layoutManager._backgroundGroup?.contains(hit))
                     this._desktop();
             }
@@ -601,6 +603,7 @@ export default class StageShelf extends Extension {
         if (this._hintTimer)
             GLib.Source.remove(this._hintTimer);
         this._hintTimer = 0;
+        this._picker = null;
         const hint = this._hint;
         this._hint = null;
         hint?.destroy();
@@ -618,7 +621,7 @@ export default class StageShelf extends Extension {
         });
     }
 
-    _members(button, windows) {
+    _members(button, windows, opener = null) {
         this._closeHint();
         if (this._drop || !button.mapped || !windows.every(w => this._parked.has(w)))
             return;
@@ -627,6 +630,15 @@ export default class StageShelf extends Extension {
         const panel = new St.BoxLayout({vertical: true, reactive: true, track_hover: true,
             style_class: 'stage-members', width: Math.round(Math.min(312 * scale, area.width * 0.55))});
         this._hint = panel;
+        this._picker = opener;
+        panel.connect('captured-event', (_panel, event) => {
+            if (event.type() === Clutter.EventType.KEY_PRESS && event.get_key_symbol() === Clutter.KEY_Escape) {
+                this._closeHint();
+                opener?.grab_key_focus();
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
         Main.layoutManager.addChrome(panel);
         const heading = new St.Label({text: `组合中的窗口 · ${windows.length}`, style_class: 'stage-members-heading'});
         panel.add_child(heading);
@@ -643,7 +655,9 @@ export default class StageShelf extends Extension {
                 x_expand: true, accessible_name: [name, title].join(' ')});
             const line = new St.BoxLayout({style_class: 'stage-member-line',
                 width: Math.max(1, panel.width - 36 * scale)});
-            const icon = app?.create_icon_texture(24);
+            const content = opener && this._pictures.get(w)?.content;
+            const icon = content ? new Clutter.Actor({content, width: 60 * scale, height: 40 * scale,
+                content_gravity: Clutter.ContentGravity.RESIZE_ASPECT}) : app?.create_icon_texture(24);
             if (icon) {
                 icon.y_align = Clutter.ActorAlign.CENTER;
                 line.add_child(icon);
@@ -660,6 +674,8 @@ export default class StageShelf extends Extension {
                     this._select([w, ...windows.filter(other => other !== w && this._parked.has(other))], false);
             });
             list.add_child(row);
+            if (opener)
+                this._dragToStage(row, line, w, this._railWidth(area), scale);
         }
         const maxHeight = Math.round(area.height * 0.63);
         scroll.height = Math.min(maxHeight, list.get_preferred_height(panel.width - 28 * scale)[1]);
@@ -669,9 +685,11 @@ export default class StageShelf extends Extension {
             Math.max(area.y, Math.min(area.y + area.height - h, Math.round(y + (button.height - h) / 2))));
         panel.connect('notify::hover', () => {
             this._turnShelf();
-            if (!panel.hover)
+            if (!panel.hover && !this._picker && !this._drop)
                 this._delayHint(220, () => { if (!button.hover) { this._closeHint(); this._queue(); } });
         });
+        if (opener)
+            list.get_first_child()?.grab_key_focus();
         panel.opacity = 0;
         panel.ease({opacity: 255, duration: 120});
     }
@@ -746,7 +764,17 @@ export default class StageShelf extends Extension {
         }
         const uniqueApps = [...new Set(apps.filter(Boolean))];
         uniqueApps.slice(0, 3).forEach((app, i) => {
-            const icon = app.create_icon_texture(24);
+            let icon = app.create_icon_texture(24);
+            if (uniqueApps.length === 1 && windows.length > 1) {
+                icon = new St.Button({child: icon, can_focus: true, style_class: 'stage-pile-icon',
+                    accessible_name: `查看 ${app.get_name()} 的 ${windows.length} 个窗口`});
+                icon.connect('clicked', () => {
+                    if (this._picker === icon)
+                        this._closeHint();
+                    else
+                        this._members(button, windows, icon);
+                });
+            }
             const positionIcon = () => {
                 const anchor = height - composite.y;
                 icon.set_position(i * 21 * scale, Math.min(height - 24 * scale, anchor - 15 * scale));
@@ -762,20 +790,28 @@ export default class StageShelf extends Extension {
                 mode: Clutter.AnimationMode.EASE_OUT_CUBIC});
             for (const shade of shades)
                 shade.ease({opacity: button.hover ? 0 : 32, duration: 145});
-            if (windows.length > 1) {
+            if (windows.length > 1 && !this._picker) {
                 if (button.hover)
                     this._delayHint(320, () => this._members(button, windows));
                 else
                     this._delayHint(220, () => { if (!this._hint?.hover) { this._closeHint(); this._queue(); } });
             }
         });
-        button.connect('clicked', () =>
-            this._select(windows, Boolean(global.get_pointer()[2] & Clutter.ModifierType.SHIFT_MASK)));
-        button._delegate = {getDragActor: () => new Clutter.Clone({source: layout, width, height}),
-            getDragActorSource: () => layout};
+        button.connect('clicked', () => {
+            const join = Boolean(global.get_pointer()[2] & Clutter.ModifierType.SHIFT_MASK);
+            this._select(join ? [windows[0]] : windows, join);
+        });
+        this._dragToStage(button, layout, windows[0], width, scale);
+        return button;
+    }
+
+    _dragToStage(button, source, window, width, scale) {
+        button._delegate = {getDragActor: () => new Clutter.Clone({source, width: source.width, height: source.height}),
+            getDragActorSource: () => source};
         const drag = DND.makeDraggable(button);
         drag.connect('drag-begin', () => {
-            this._closeHint();
+            if (!this._picker)
+                this._closeHint();
             const area = Main.layoutManager.getWorkAreaForMonitor(Main.layoutManager.primaryIndex);
             this._drop = new St.Widget({reactive: true});
             this._drop.set_position(area.x + width + 6 * scale, area.y);
@@ -783,7 +819,9 @@ export default class StageShelf extends Extension {
             this._drop._delegate = {
                 handleDragOver: () => DND.DragMotionResult.MOVE_DROP,
                 acceptDrop: () => {
-                    this._select([windows[0]], true);
+                    if (!this._parked.has(window))
+                        return false;
+                    this._select([window], true);
                     return true;
                 },
             };
@@ -794,7 +832,6 @@ export default class StageShelf extends Extension {
             this._drop = null;
             this._queue();
         });
-        return button;
     }
 
     disable() {
