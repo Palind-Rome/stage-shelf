@@ -54,8 +54,10 @@ export default class StageShelf extends Extension {
         this._slots = new Map();
         this._pageKey = '';
         this._recentVisible = true;
+        this._previewActors = new Map();
         this._tracker = Shell.WindowTracker.get_default();
         this._shelf = new St.BoxLayout({vertical: true, reactive: true, track_hover: true, style: 'spacing: 8px;'});
+        this._opening = new St.Adjustment({actor: this._shelf, lower: 0, upper: 1, value: 0});
         Main.layoutManager.addChrome(this._shelf, {trackFullscreen: true});
         this._edge = new St.Widget({reactive: true});
         Main.layoutManager.addChrome(this._edge, {trackFullscreen: true});
@@ -67,12 +69,14 @@ export default class StageShelf extends Extension {
             }
             this._edge.hide();
             this._shelf.show();
+            this._turnShelf(true);
             this._shelf.translation_x = -this._shelf.width * 0.65;
             this._shelf.opacity = 100;
             this._shelf.ease({translation_x: 0, opacity: 255, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_CUBIC});
             return Clutter.EVENT_PROPAGATE;
         });
         this._shelf.connect('notify::hover', () => {
+            this._turnShelf();
             if (this._covered && !this._shelf.hover && !this._hint)
                 this._queue();
             return Clutter.EVENT_PROPAGATE;
@@ -228,6 +232,13 @@ export default class StageShelf extends Extension {
         }
     }
 
+    _turnShelf(open = this._shelf.hover || Boolean(this._hint?.hover)) {
+        this._opening.ease(open ? 1 : 0, {
+            duration: open ? 210 : 185,
+            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+        });
+    }
+
     _hideShelf() {
         this._closeHint();
         this._shelf.hide();
@@ -310,7 +321,10 @@ export default class StageShelf extends Extension {
             const content = new Clutter.Image();
             content.set_bytes(bytes, pixels.has_alpha ? Cogl.PixelFormat.RGBA_8888 : Cogl.PixelFormat.RGB_888, width, height, pixels.rowstride);
             this._pictures.set(w, {content});
-            if (this._parked.has(w)) {
+            const picture = this._previewActors.get(w);
+            if (picture) {
+                picture.content = content;
+            } else if (this._parked.has(w)) {
                 this._pageKey = '';
                 this._queue();
             }
@@ -649,6 +663,7 @@ export default class StageShelf extends Extension {
         panel.set_position(Math.round(x + button.width + 2 * scale),
             Math.max(area.y, Math.min(area.y + area.height - h, Math.round(y + (button.height - h) / 2))));
         panel.connect('notify::hover', () => {
+            this._turnShelf();
             if (!panel.hover)
                 this._delayHint(220, () => { if (!button.hover) { this._closeHint(); this._queue(); } });
         });
@@ -670,15 +685,23 @@ export default class StageShelf extends Extension {
         const spanY = Math.max(...rects.map(r => r.y + r.height)) - top;
         const shrink = Math.min(height * 0.78 / Math.max(1, spanY), width * 1.40 / Math.max(1, spanX));
         const composite = new Clutter.Actor({width: spanX * shrink, height: spanY * shrink});
-        const taper = 0.12;
-        const matrix = new Graphene.Matrix();
-        matrix.init_from_float([0.72, tilt * 0.15 + taper * composite.height / (2 * composite.width),
-            0, taper / composite.width, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
-        composite.set_transform(matrix);
-        const y = Math.round((height - composite.height) / 2);
-        composite.set_position(5 * scale, y);
+        const updatePerspective = () => {
+            const progress = this._opening.value;
+            const rest = 1 - progress;
+            const taper = 0.12 * rest;
+            const fit = Math.min(1, (width - 8 * scale) / composite.width);
+            const sy = rest + fit * progress;
+            const sx = 0.72 * rest + fit * progress;
+            const matrix = new Graphene.Matrix();
+            matrix.init_from_float([sx, tilt * 0.15 * rest + taper * composite.height / (2 * composite.width),
+                0, taper / composite.width, 0, sy, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+            composite.set_transform(matrix);
+            composite.set_position(5 * scale, (height - composite.height * sy) / 2);
+        };
+        updatePerspective();
+        this._opening.connectObject('notify::value', updatePerspective, composite);
         layout.add_child(composite);
-        const anchorY = y + composite.height;
+
         for (let i = rects.length - 1; i >= 0; i--) {
             const r = rects[i];
             const shot = this._pictures.get(windows[i]);
@@ -692,6 +715,12 @@ export default class StageShelf extends Extension {
                 picture.add_effect(edge);
                 edge.sizeFor(w, h);
                 face.add_child(picture);
+                const window = windows[i];
+                this._previewActors.set(window, picture);
+                picture.connect('destroy', () => {
+                    if (this._previewActors.get(window) === picture)
+                        this._previewActors.delete(window);
+                });
             } else {
                 face.add_style_class_name('stage-unavailable');
                 const label = new St.Label({text: apps[i]?.get_name() || windows[i].get_title() || '窗口',
@@ -709,7 +738,12 @@ export default class StageShelf extends Extension {
         const uniqueApps = [...new Set(apps.filter(Boolean))];
         uniqueApps.slice(0, 3).forEach((app, i) => {
             const icon = app.create_icon_texture(24);
-            icon.set_position(i * 21 * scale, Math.min(height - 24 * scale, anchorY - 15 * scale));
+            const positionIcon = () => {
+                const anchor = height - composite.y;
+                icon.set_position(i * 21 * scale, Math.min(height - 24 * scale, anchor - 15 * scale));
+            };
+            positionIcon();
+            composite.connectObject('notify::y', positionIcon, icon);
             layout.add_child(icon);
         });
         button.connect('notify::hover', () => {
@@ -719,8 +753,6 @@ export default class StageShelf extends Extension {
                 else
                     this._delayHint(220, () => { if (!this._hint?.hover) { this._closeHint(); this._queue(); } });
             }
-            layout.ease({translation_x: button.hover ? 5 * scale : 0,
-                scale_x: button.hover ? 1.08 : 1, scale_y: button.hover ? 1.04 : 1, duration: 150});
         });
         button.connect('clicked', () =>
             this._select(windows, Boolean(global.get_pointer()[2] & Clutter.ModifierType.SHIFT_MASK)));
@@ -774,6 +806,8 @@ export default class StageShelf extends Extension {
         Main.layoutManager.removeChrome(this._shelf);
         this._edge.destroy();
         this._shelf.destroy();
+        this._opening.remove_transition('value');
+        this._previewActors.clear();
         this._workspace = null;
     }
 }
