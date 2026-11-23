@@ -54,6 +54,8 @@ export default class StageShelf extends Extension {
         this._slots = new Map();
         this._pageKey = '';
         this._recentVisible = true;
+        this._leaveWatch = 0;
+        this._retracting = false;
         this._previewActors = new Map();
         this._tracker = Shell.WindowTracker.get_default();
         this._shelf = new St.BoxLayout({vertical: true, reactive: true, track_hover: true, style: 'spacing: 8px;'});
@@ -68,7 +70,9 @@ export default class StageShelf extends Extension {
                 return Clutter.EVENT_PROPAGATE;
             }
             this._edge.hide();
+            this._retracting = false;
             this._shelf.show();
+            this._watchLeave();
             this._turnShelf(true);
             this._shelf.translation_x = -this._shelf.width * 0.65;
             this._shelf.opacity = 100;
@@ -244,7 +248,56 @@ export default class StageShelf extends Extension {
         });
     }
 
+    _pointerInside(actor, leftMargin = 0) {
+        if (!actor?.visible)
+            return false;
+        const [px, py] = global.get_pointer();
+        return px >= actor.x - leftMargin && px < actor.x + actor.width &&
+            py >= actor.y && py < actor.y + actor.height;
+    }
+
+    _watchLeave() {
+        if (this._leaveWatch)
+            return;
+        // At the edge, the pointer may never enter the moving shelf actor,
+        // so no hover-leave signal is guaranteed.
+        this._leaveWatch = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+            if (this._covered && !this._drop && !this._pointerInside(this._shelf, this._shelf.x - this._edge.x) &&
+                !this._pointerInside(this._hint, 3)) {
+                this._closeHint();
+                this._queue();
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopLeaveWatch() {
+        if (this._leaveWatch)
+            GLib.Source.remove(this._leaveWatch);
+        this._leaveWatch = 0;
+    }
+
+    _retractShelf() {
+        if (this._retracting)
+            return;
+        this._retracting = true;
+        this._turnShelf(false);
+        this._shelf.ease({translation_x: -this._shelf.width * 0.65, opacity: 0, duration: 150,
+            mode: Clutter.AnimationMode.EASE_IN_QUAD,
+            onComplete: () => {
+                if (!this._retracting)
+                    return;
+                this._retracting = false;
+                this._shelf.hide();
+                this._edge.show();
+                this._stopLeaveWatch();
+            }});
+    }
+
     _hideShelf() {
+        this._stopLeaveWatch();
+        this._retracting = false;
+        this._shelf.remove_all_transitions();
         this._closeHint();
         this._shelf.hide();
         this._edge.hide();
@@ -594,9 +647,26 @@ export default class StageShelf extends Extension {
         });
         const [px, py] = global.get_pointer();
         const inside = px >= area.x && px <= x + width && py >= y && py <= y + total;
-        this._shelf.visible = !this._covered || inside || Boolean(this._hint?.hover);
-        this._edge.visible = !this._shelf.visible;
-        this._turnShelf(this._covered && this._shelf.visible);
+        if (this._covered && !inside && !this._pointerInside(this._hint, 3) && !this._drop) {
+            if (this._shelf.visible)
+                this._retractShelf();
+            else
+                this._edge.show();
+            return;
+        }
+        if (!this._covered || this._retracting || !this._shelf.visible) {
+            this._retracting = false;
+            this._shelf.remove_all_transitions();
+            this._shelf.translation_x = 0;
+            this._shelf.opacity = 255;
+        }
+        this._shelf.show();
+        this._edge.hide();
+        if (this._covered)
+            this._watchLeave();
+        else
+            this._stopLeaveWatch();
+        this._turnShelf(this._covered);
     }
 
     _closeHint() {
