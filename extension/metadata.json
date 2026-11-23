@@ -4,5 +4,5 @@
   "description": "Switch between window groups using a shelf of previews on the left edge of the desktop.",
   "shell-version": ["46"],
   "url": "https://github.com/Palind-Rome/stage-shelf",
-  "version": 2
+  "version": 3
 }

@@ -206,14 +206,10 @@ export default class StageShelf extends Extension {
         if (!actor?.mapped || !w.can_minimize())
             return;
         try {
-            const frame = w.get_frame_rect();
-            const buffer = w.get_buffer_rect();
-            const clip = new Mtk.Rectangle({x: frame.x - buffer.x, y: frame.y - buffer.y,
-                width: frame.width, height: frame.height});
+            // Capture the entire actor, including client-side decorations.
             // A freshly mapped actor may not have received a buffer yet.
-            const content = actor.get_texture()?.get_texture()
-                ? actor.paint_to_content(clip) ?? actor.paint_to_content(null) : null;
-            this._pictures.set(w, {content, ratio: frame.width / frame.height});
+            const content = actor.get_texture()?.get_texture() ? actor.paint_to_content(null) : null;
+            this._pictures.set(w, {content});
         } catch (error) {
             console.debug('Stage Shelf preview unavailable', error.message);
         }
