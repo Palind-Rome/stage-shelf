@@ -1,3 +1,6 @@
+import Gio from 'gi://Gio';
+import Cogl from 'gi://Cogl';
+import GdkPixbuf from 'gi://GdkPixbuf';
 import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';
 import Graphene from 'gi://Graphene';
@@ -41,6 +44,7 @@ export default class StageShelf extends Extension {
         this._updates = new Set();
         this._updateTimer = 0;
         this._pictures = new Map();
+        this._captures = new WeakMap();
         this._groups = new Map();
         this._front = null;
         this._pending = 0;
@@ -198,7 +202,6 @@ export default class StageShelf extends Extension {
 
     _restore(w) {
         this._manual.delete(w);
-        this._pictures.delete(w);
         if (this._parked.delete(w) && w.minimized)
             this._animateWindow(w, false);
     }
@@ -245,6 +248,7 @@ export default class StageShelf extends Extension {
             if (pos && frame.x === pos.x && frame.y === pos.y && !w.get_maximized() && !w.fullscreen)
                 w.move_frame(false, pos.oldX, pos.oldY);
         }
+        this._pictures.clear();
         this._placed.clear();
         this._slots.clear();
         this._pageKey = '';
@@ -263,15 +267,52 @@ export default class StageShelf extends Extension {
         this._animateWindow(w, true);
     }
 
-    _capture(w, actor) {
+    async _capture(w, actor) {
+        const ticket = {};
         try {
-            // Capture the entire actor, including client-side decorations.
-            // A freshly mapped actor may not have received a buffer yet.
-            const content = actor.get_texture()?.get_texture() ? actor.paint_to_content(null) : null;
-            if (content) {
-                this._pictures.set(w, {content});
-                if (this._parked.has(w))
-                    this._pageKey = '';
+            const buffer = actor.get_texture()?.get_texture();
+            if (!buffer)
+                return;
+            // X11 supplies a single client texture before Shell applies its fade.
+            const texture = !Meta.is_wayland_compositor() && buffer.is_simple()
+                ? buffer.get_plane(0) : actor.paint_to_content(null)?.get_texture();
+            if (!texture)
+                return;
+            this._captures.set(w, ticket);
+            const stream = Gio.MemoryOutputStream.new_resizable();
+            let raw;
+            try {
+                raw = await Shell.Screenshot.composite_to_stream(texture, 0, 0,
+                    texture.get_width(), texture.get_height(), 1, null, 0, 0, 1, stream);
+            } finally {
+                stream.close(null);
+            }
+            if (!raw || !this._running || !this._watched.has(w) || this._captures.get(w) !== ticket)
+                return;
+            const scale = Math.min(1, 480 / Math.max(raw.width, raw.height));
+            const width = Math.max(1, Math.round(raw.width * scale));
+            const height = Math.max(1, Math.round(raw.height * scale));
+            const pixels = raw.scale_simple(width, height, GdkPixbuf.InterpType.BILINEAR);
+            const bytes = pixels.read_pixel_bytes();
+            // A successful readback may still be entirely transparent during unmap.
+            const data = bytes.get_data();
+            let visible = !pixels.has_alpha;
+            for (let y = 0; y < height && !visible; y++) {
+                for (let x = 0; x < width; x++) {
+                    if (data[y * pixels.rowstride + x * 4 + 3] > 16) {
+                        visible = true;
+                        break;
+                    }
+                }
+            }
+            if (!visible)
+                return;
+            const content = new Clutter.Image();
+            content.set_bytes(bytes, pixels.has_alpha ? Cogl.PixelFormat.RGBA_8888 : Cogl.PixelFormat.RGB_888, width, height, pixels.rowstride);
+            this._pictures.set(w, {content});
+            if (this._parked.has(w)) {
+                this._pageKey = '';
+                this._queue();
             }
         } catch (error) {
             console.debug('Stage Shelf preview unavailable', error.message);
@@ -290,7 +331,7 @@ export default class StageShelf extends Extension {
     }
 
     _damage(w) {
-        if (!this._parked.has(w) || !this._shelf.visible)
+        if (this._pictures.has(w) && (!this._parked.has(w) || !this._shelf.visible))
             return;
         this._updates.add(w);
         if (this._updateTimer)
@@ -299,7 +340,7 @@ export default class StageShelf extends Extension {
             this._updateTimer = 0;
             for (const window of this._updates) {
                 const actor = window.get_compositor_private();
-                if (this._parked.has(window) && actor?.mapped)
+                if (actor?.mapped && this._watched.has(window))
                     this._capture(window, actor);
             }
             this._updates.clear();
@@ -341,6 +382,8 @@ export default class StageShelf extends Extension {
                 if (this._manual.delete(w))
                     this._parked.delete(w);
                 this._restore(w);
+                this._updates.delete(w);
+                this._pictures.delete(w);
                 w.get_compositor_private()?.disconnectObject(this);
                 ids.forEach(id => w.disconnect(id));
                 this._watched.delete(w);
@@ -380,6 +423,8 @@ export default class StageShelf extends Extension {
                     this._queue();
                 }));
                 this._watched.set(w, ids);
+                if (actor?.mapped)
+                    this._damage(w);
             }
         }
 
@@ -648,8 +693,11 @@ export default class StageShelf extends Extension {
                 edge.sizeFor(w, h);
                 face.add_child(picture);
             } else {
-                const label = new St.Label({text: apps[i]?.get_name() ?? windows[i].get_title(), style_class: 'stage-missing'});
+                face.add_style_class_name('stage-unavailable');
+                const label = new St.Label({text: apps[i]?.get_name() || windows[i].get_title() || '窗口',
+                    style_class: 'stage-missing', width: w});
                 face.add_child(label);
+                label.y = Math.round(h * 0.35);
             }
             // Expose a sliver when multiple windows occupy the same rectangle.
             const coincident = i > 0 && Math.abs(r.x - rects[0].x) * shrink < 4 * scale &&
