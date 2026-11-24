@@ -58,7 +58,10 @@ export default class StageShelf extends Extension {
         this._retracting = false;
         this._previewActors = new Map();
         this._tracker = Shell.WindowTracker.get_default();
-        this._shelf = new St.BoxLayout({vertical: true, reactive: true, track_hover: true, style: 'spacing: 8px;'});
+        // GNOME derives the X11 stage input region from the chrome actor.
+        // Keep its allocation stationary while the buttons slide inside it.
+        this._cards = new St.BoxLayout({vertical: true, style: 'spacing: 8px;'});
+        this._shelf = new St.Bin({child: this._cards, reactive: true, track_hover: true, clip_to_allocation: true});
         this._opening = new St.Adjustment({actor: this._shelf, lower: 0, upper: 1, value: 0});
         Main.layoutManager.addChrome(this._shelf, {trackFullscreen: true});
         this._edge = new St.Widget({reactive: true});
@@ -74,9 +77,9 @@ export default class StageShelf extends Extension {
             this._shelf.show();
             this._watchLeave();
             this._turnShelf(true);
-            this._shelf.translation_x = -this._shelf.width * 0.65;
-            this._shelf.opacity = 100;
-            this._shelf.ease({translation_x: 0, opacity: 255, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_CUBIC});
+            this._cards.translation_x = -this._shelf.width * 0.65;
+            this._cards.opacity = 100;
+            this._cards.ease({translation_x: 0, opacity: 255, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_CUBIC});
             return Clutter.EVENT_PROPAGATE;
         });
         this._shelf.connect('notify::hover', () => {
@@ -282,7 +285,7 @@ export default class StageShelf extends Extension {
             return;
         this._retracting = true;
         this._turnShelf(false);
-        this._shelf.ease({translation_x: -this._shelf.width * 0.65, opacity: 0, duration: 150,
+        this._cards.ease({translation_x: -this._shelf.width * 0.65, opacity: 0, duration: 150,
             mode: Clutter.AnimationMode.EASE_IN_QUAD,
             onComplete: () => {
                 if (!this._retracting)
@@ -297,7 +300,7 @@ export default class StageShelf extends Extension {
     _hideShelf() {
         this._stopLeaveWatch();
         this._retracting = false;
-        this._shelf.remove_all_transitions();
+        this._cards.remove_all_transitions();
         this._closeHint();
         this._shelf.hide();
         this._edge.hide();
@@ -381,12 +384,8 @@ export default class StageShelf extends Extension {
             content.set_bytes(bytes, pixels.has_alpha ? Cogl.PixelFormat.RGBA_8888 : Cogl.PixelFormat.RGB_888, width, height, pixels.rowstride);
             this._pictures.set(w, {content});
             const picture = this._previewActors.get(w);
-            if (picture) {
+            if (picture)
                 picture.content = content;
-            } else if (this._parked.has(w)) {
-                this._pageKey = '';
-                this._queue();
-            }
         } catch (error) {
             console.debug('Stage Shelf preview unavailable', error.message);
         }
@@ -606,7 +605,7 @@ export default class StageShelf extends Extension {
     _draw(stages, monitor) {
         if (!stages.length || this._fullscreen()) {
             this._pageKey = '';
-            this._shelf.destroy_all_children();
+            this._cards.destroy_all_children();
             this._hideShelf();
             return;
         }
@@ -624,10 +623,10 @@ export default class StageShelf extends Extension {
         const key = JSON.stringify([width, scale, ...page.map(set => set.map(w => w.get_stable_sequence()))]);
         if (key !== this._pageKey) {
             this._closeHint();
-            this._shelf.destroy_all_children();
+            this._cards.destroy_all_children();
             page.forEach((windows, i) => {
                 const tilt = Math.max(-1, Math.min(1, (total / 2 - i * (height + gap) - height / 2) / (2 * height)));
-                this._shelf.add_child(this._card(windows, width, height, scale, tilt));
+                this._cards.add_child(this._card(windows, width, height, scale, tilt));
             });
             this._pageKey = key;
         }
@@ -656,9 +655,9 @@ export default class StageShelf extends Extension {
         }
         if (!this._covered || this._retracting || !this._shelf.visible) {
             this._retracting = false;
-            this._shelf.remove_all_transitions();
-            this._shelf.translation_x = 0;
-            this._shelf.opacity = 255;
+            this._cards.remove_all_transitions();
+            this._cards.translation_x = 0;
+            this._cards.opacity = 255;
         }
         this._shelf.show();
         this._edge.hide();
@@ -802,25 +801,28 @@ export default class StageShelf extends Extension {
             const w = Math.max(1, r.width * shrink);
             const h = Math.max(1, r.height * shrink);
             const face = new St.Widget({style_class: 'stage-face', width: w, height: h});
-            if (shot?.content) {
-                const picture = new Clutter.Actor({content: shot.content, width: w, height: h});
-                picture.set_content_scaling_filters(Clutter.ScalingFilter.TRILINEAR, Clutter.ScalingFilter.LINEAR);
-                const edge = new PreviewEdge();
-                picture.add_effect(edge);
-                edge.sizeFor(w, h);
-                face.add_child(picture);
-                const window = windows[i];
-                this._previewActors.set(window, picture);
-                picture.connect('destroy', () => {
-                    if (this._previewActors.get(window) === picture)
-                        this._previewActors.delete(window);
-                });
-            } else {
+            const picture = new Clutter.Actor({content: shot?.content ?? null, width: w, height: h});
+            picture.set_content_scaling_filters(Clutter.ScalingFilter.TRILINEAR, Clutter.ScalingFilter.LINEAR);
+            const edge = new PreviewEdge();
+            picture.add_effect(edge);
+            edge.sizeFor(w, h);
+            face.add_child(picture);
+            const window = windows[i];
+            this._previewActors.set(window, picture);
+            picture.connect('destroy', () => {
+                if (this._previewActors.get(window) === picture)
+                    this._previewActors.delete(window);
+            });
+            if (!shot?.content) {
                 face.add_style_class_name('stage-unavailable');
                 const label = new St.Label({text: apps[i]?.get_name() || windows[i].get_title() || '窗口',
                     style_class: 'stage-missing', width: w});
                 face.add_child(label);
                 label.y = Math.round(h * 0.35);
+                picture.connectObject('notify::content', () => {
+                    face.remove_style_class_name('stage-unavailable');
+                    label.destroy();
+                }, label);
             }
             const shade = new St.Widget({style_class: 'stage-idle-shade', width: w, height: h, opacity: 32});
             face.add_child(shade);
